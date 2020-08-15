@@ -1,30 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
 
-# TODO: find a use for these, or remove them?
-define_property(TARGET PROPERTY Halide_GEN_TARGET
-                BRIEF_DOCS "On a Halide library target, names the generator target used to create it"
-                FULL_DOCS "On a Halide library target, names the generator target used to create it")
-
-define_property(TARGET PROPERTY Halide_FILTER_NAME
-                BRIEF_DOCS "On a Halide library target, names the filter this library corresponds to"
-                FULL_DOCS "On a Halide library target, names the filter this library corresponds to")
-
-define_property(TARGET PROPERTY Halide_LIBNAME
-                BRIEF_DOCS "On a Halide library target, names the function it provides"
-                FULL_DOCS "On a Halide library target, names the function it provides")
-
-define_property(TARGET PROPERTY Halide_RUNTIME
-                BRIEF_DOCS "On a Halide library target, names the runtime target it depends on"
-                FULL_DOCS "On a Halide library target, names the runtime target it depends on")
-
-define_property(TARGET PROPERTY Halide_PARAMS
-                BRIEF_DOCS "On a Halide library target, lists the parameters used to configure the filter"
-                FULL_DOCS "On a Halide library target, lists the parameters used to configure the filter")
-
-define_property(TARGET PROPERTY Halide_TARGETS
-                BRIEF_DOCS "On a Halide library target, lists the runtime targets supported by the filter"
-                FULL_DOCS "On a Halide library target, lists the runtime targets supported by the filter")
-
 define_property(TARGET PROPERTY Halide_RT_TARGETS
                 BRIEF_DOCS "On a Halide runtime target, lists the targets the runtime backs"
                 FULL_DOCS "On a Halide runtime target, lists the targets the runtime backs")
@@ -37,8 +12,8 @@ function(add_halide_library TARGET)
     # See Module.cpp for list of extra outputs. The following outputs intentionally do not appear:
     # - `c_header` is always generated
     # - `c_source` is handled by C_BACKEND
-    # - `static_library` is the default
-    # - `object` is not available
+    # - `object` is selected for CMake-target-compile
+    # - `static_library` is selected for cross-compile
     # - `cpp_stub` is not available
     set(EXTRA_OUTPUT_NAMES
         ASSEMBLY
@@ -70,9 +45,9 @@ function(add_halide_library TARGET)
     # Parse the arguments and set defaults for missing values.
     ##
 
-    set(options GRADIENT_DESCENT C_BACKEND)
+    set(options C_BACKEND GRADIENT_DESCENT)
     set(oneValueArgs FROM GENERATOR FUNCTION_NAME USE_RUNTIME AUTOSCHEDULER ${EXTRA_OUTPUT_NAMES})
-    set(multiValueArgs PARAMS TARGETS FEATURES PLUGINS)
+    set(multiValueArgs TARGETS FEATURES PARAMS PLUGINS)
     cmake_parse_arguments(ARG "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
 
     if (NOT "${ARG_UNPARSED_ARGUMENTS}" STREQUAL "")
@@ -83,11 +58,16 @@ function(add_halide_library TARGET)
         message(FATAL_ERROR "Missing FROM argument specifying a Halide generator target")
     endif ()
 
-    if (ARG_GRADIENT_DESCENT)
-        set(GRADIENT_DESCENT 1)
-    else ()
-        set(GRADIENT_DESCENT 0)
+    if (ARG_C_BACKEND)
+        if (ARG_USE_RUNTIME)
+            message(AUTHOR_WARNING "The C backend does not use a runtime.")
+        endif ()
+        if (ARG_TARGETS)
+            message(AUTHOR_WARNING "The C backend sources will be compiled with the current CMake toolchain.")
+        endif ()
     endif ()
+
+    set(GRADIENT_DESCENT "$<BOOL:${ARG_GRADIENT_DESCENT}>")
 
     if (NOT ARG_GENERATOR)
         set(ARG_GENERATOR "${TARGET}")
@@ -100,46 +80,16 @@ function(add_halide_library TARGET)
     if (NOT ARG_TARGETS)
         if (NOT "${Halide_TARGET}" STREQUAL "")
             set(ARG_TARGETS "${Halide_TARGET}")
-        elseif (NOT "$ENV{HL_TARGET}" STREQUAL "")
-            set(ARG_TARGETS "$ENV{HL_TARGET}")
         else ()
-            set(ARG_TARGETS host)
+            _Halide_cmake_target(ARG_TARGETS)
         endif ()
     endif ()
 
-    if (ARG_C_BACKEND AND ARG_USE_RUNTIME)
-        message(AUTHOR_WARNING "Warning: the C backend does not use a runtime.")
+    list(JOIN ARG_FEATURES "-" features)
+    if (features)
+        list(TRANSFORM ARG_TARGETS APPEND "-${features}")
     endif ()
-
-    ##
-    # Add features to targets list
-    ##
-
-    unset(GEN_TARGETS)
-    foreach (T IN LISTS ARG_TARGETS)
-        if ("${T}" STREQUAL "")
-            set(T host)
-        endif ()
-        foreach (F IN LISTS ARG_FEATURES)
-            set(T "${T}-${F}")
-        endforeach ()
-        list(APPEND GEN_TARGETS "${T}-no_runtime")
-    endforeach ()
-
-    ##
-    # Windows compatibility definitions
-    ##
-
-    # On Linux, RPATH allows the generator to find Halide, but we need to add it to the PATH on Windows.
-    set(generatorCommand ${ARG_FROM})
-    if (WIN32)
-        set(newPath "$<TARGET_FILE_DIR:Halide::Halide>" $ENV{PATH})
-        string(REPLACE ";" "$<SEMICOLON>" newPath "${newPath}")
-        set(generatorCommand ${CMAKE_COMMAND} -E env "PATH=$<SHELL_PATH:${newPath}>" "$<TARGET_FILE:${ARG_FROM}>")
-    endif ()
-
-    # The output file name might not match the host when cross compiling.
-    _Halide_get_library_suffix(Halide_STATIC_LIBRARY_SUFFIX ${GEN_TARGETS})
+    list(TRANSFORM ARG_TARGETS APPEND "-no_runtime")
 
     ##
     # Set up the runtime library, if needed
@@ -151,59 +101,57 @@ function(add_halide_library TARGET)
     else ()
         # If we're not using an existing runtime, create one.
         if (NOT ARG_USE_RUNTIME)
-            add_library("${TARGET}.runtime" STATIC IMPORTED)
-            target_link_libraries("${TARGET}.runtime" INTERFACE Halide::Runtime Threads::Threads ${CMAKE_DL_LIBS})
-
-            set_target_properties("${TARGET}.runtime"
-                                  PROPERTIES
-                                  IMPORTED_LOCATION "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}.runtime${Halide_STATIC_LIBRARY_SUFFIX}")
-
-            # Defers reading the list of targets for which to generate a common runtime to CMake _generation_ time.
-            # This prevents issues where a lower GCD is required by a later Halide library linking to this runtime.
-            add_custom_command(OUTPUT "${TARGET}.runtime${Halide_STATIC_LIBRARY_SUFFIX}"
-                               COMMAND ${generatorCommand} -r "${TARGET}.runtime" -o .
-                               target=$<JOIN:$<TARGET_PROPERTY:${TARGET}.runtime,Halide_RT_TARGETS>,$<COMMA>>
-                               DEPENDS "${ARG_FROM}")
-
-            add_custom_target("${TARGET}.runtime.update" DEPENDS "${TARGET}.runtime${Halide_STATIC_LIBRARY_SUFFIX}")
-
-            add_dependencies("${TARGET}.runtime" "${TARGET}.runtime.update")
+            add_halide_runtime("${TARGET}.runtime" FROM ${ARG_FROM}
+                               TARGETS ${ARG_TARGETS})
             set(ARG_USE_RUNTIME "${TARGET}.runtime")
         elseif (NOT TARGET ${ARG_USE_RUNTIME})
-            # Require a user-supplied runtime target to exist.
             message(FATAL_ERROR "Invalid runtime target ${ARG_USE_RUNTIME}")
+        else ()
+            _Halide_add_targets_to_runtime(${ARG_USE_RUNTIME} TARGETS ${ARG_TARGETS})
         endif ()
-
-        # Add in the runtime targets but first remove features that should not be attached to a runtime
-        # TODO: The fact that profile being here fixes a linker error on Windows smells like a bug.
-        #       It complains about a symbol being duplicated between the runtime and the object.
-        set(RT_TARGETS ${GEN_TARGETS})
-        foreach (T IN ITEMS user_context no_asserts no_bounds_query no_runtime profile)
-            string(REPLACE "-${T}" "" RT_TARGETS "${RT_TARGETS}")
-        endforeach ()
-
-        set_property(TARGET "${ARG_USE_RUNTIME}" APPEND PROPERTY Halide_RT_TARGETS "${RT_TARGETS}")
-
-        # Finally, add any new GPU libraries to the runtime
-        _Halide_target_link_gpu_libs(${ARG_USE_RUNTIME} INTERFACE ${GEN_TARGETS})
     endif ()
 
     ##
     # Determine which outputs the generator call will emit.
     ##
 
+    _Halide_get_platform_details(
+            generatorCommand
+            crosscompiling
+            object_suffix
+            static_library_suffix
+            ${ARG_TARGETS})
+
+    if (crosscompiling)
+        message(STATUS "Halide generator '${ARG_FROM}' cross-compiling '${TARGET}' for '${ARG_TARGETS}'.")
+    endif ()
+
     # Always emit a C header
     set(GENERATOR_OUTPUTS c_header)
     set(GENERATOR_OUTPUT_FILES "${TARGET}.h")
 
-    # Then either a C source or static library
+    # Then either a C source, a set of object files, or a cross-compiled static library.
     if (ARG_C_BACKEND)
         list(APPEND GENERATOR_OUTPUTS c_source)
-        list(APPEND GENERATOR_OUTPUT_FILES "${TARGET}.halide_generated.cpp")
-    else ()
+        set(GENERATOR_SOURCES "${TARGET}.halide_generated.cpp")
+    elseif (crosscompiling)
+        # When cross-compiling, we need to use a static, imported library
         list(APPEND GENERATOR_OUTPUTS static_library)
-        list(APPEND GENERATOR_OUTPUT_FILES "${TARGET}${Halide_STATIC_LIBRARY_SUFFIX}")
+        set(GENERATOR_SOURCES "${TARGET}${static_library_suffix}")
+    else ()
+        # When compiling for the current CMake toolchain, create a native
+        list(APPEND GENERATOR_OUTPUTS object)
+        list(LENGTH ARG_TARGETS len)
+        if (len EQUAL 1)
+            set(GENERATOR_SOURCES "${TARGET}${object_suffix}")
+        else ()
+            set(GENERATOR_SOURCES wrapper ${ARG_TARGETS})
+            list(TRANSFORM GENERATOR_SOURCES REPLACE "-" "_")
+            list(TRANSFORM GENERATOR_SOURCES PREPEND "${TARGET}_")
+            list(TRANSFORM GENERATOR_SOURCES APPEND "${object_suffix}")
+        endif ()
     endif ()
+    list(APPEND GENERATOR_OUTPUT_FILES ${GENERATOR_SOURCES})
 
     # Add in extra outputs using the table defined at the start of this function
     foreach (OUT IN LISTS EXTRA_OUTPUT_NAMES)
@@ -237,33 +185,25 @@ function(add_halide_library TARGET)
     # Main library target for filter.
     ##
 
-    if (ARG_C_BACKEND)
-        add_library("${TARGET}" STATIC "${TARGET}.halide_generated.cpp")
-        set_target_properties("${TARGET}" PROPERTIES POSITION_INDEPENDENT_CODE ON)
-    else ()
+    if (crosscompiling)
         add_library("${TARGET}" STATIC IMPORTED)
         set_target_properties("${TARGET}" PROPERTIES
+                              IMPORTED_LOCATION "${CMAKE_CURRENT_BINARY_DIR}/${GENERATOR_SOURCES}")
+    else ()
+        add_library("${TARGET}" STATIC ${GENERATOR_SOURCES})
+        set_target_properties("${TARGET}" PROPERTIES
                               POSITION_INDEPENDENT_CODE ON
-                              IMPORTED_LOCATION "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}${Halide_STATIC_LIBRARY_SUFFIX}")
+                              LINKER_LANGUAGE CXX)
     endif ()
 
     # Load the plugins and setup dependencies
     unset(GEN_PLUGINS)
     if (ARG_PLUGINS)
-        add_dependencies("${TARGET}" ${ARG_PLUGINS})
         foreach (P IN LISTS ARG_PLUGINS)
             list(APPEND GEN_PLUGINS "$<TARGET_FILE:${P}>")
         endforeach ()
         set(GEN_PLUGINS -p "$<JOIN:${GEN_PLUGINS},$<COMMA>>")
     endif ()
-
-    set_target_properties("${TARGET}" PROPERTIES
-                          Halide_GEN_TARGET "${ARG_FROM}"
-                          Halide_FILTER_NAME "${ARG_GENERATOR}"
-                          Halide_LIBNAME "${ARG_FUNCTION_NAME}"
-                          Halide_PARAMS "${ARG_PARAMS}"
-                          Halide_RUNTIME "${ARG_USE_RUNTIME}"
-                          Halide_TARGETS "${GEN_TARGETS}")
 
     add_custom_command(OUTPUT ${GENERATOR_OUTPUT_FILES}
                        COMMAND ${generatorCommand}
@@ -275,12 +215,13 @@ function(add_halide_library TARGET)
                        ${GEN_PLUGINS}
                        ${GEN_AUTOSCHEDULER}
                        -o .
-                       "target=$<JOIN:${GEN_TARGETS},$<COMMA>>"
+                       "target=$<JOIN:${ARG_TARGETS},$<COMMA>>"
                        ${ARG_PARAMS}
-                       DEPENDS "${ARG_FROM}")
+                       DEPENDS ${ARG_FROM} ${ARG_PLUGINS}
+                       VERBATIM)
 
     list(TRANSFORM GENERATOR_OUTPUT_FILES PREPEND "${CMAKE_CURRENT_BINARY_DIR}/")
-    add_custom_target("${TARGET}.update" DEPENDS ${GENERATOR_OUTPUT_FILES})
+    add_custom_target("${TARGET}.update" ALL DEPENDS ${GENERATOR_OUTPUT_FILES})
 
     add_dependencies("${TARGET}" "${TARGET}.update")
 
@@ -288,17 +229,153 @@ function(add_halide_library TARGET)
     target_link_libraries("${TARGET}" INTERFACE "${ARG_USE_RUNTIME}")
 endfunction()
 
-function(_Halide_get_library_suffix OUTVAR)
+##
+# Function for creating a standalone runtime from a generator.
+##
+
+function(add_halide_runtime RT)
+    cmake_parse_arguments(ARG "" "FROM" "TARGETS" ${ARGN})
+    _Halide_get_platform_details(
+            generatorCommand
+            crosscompiling
+            object_suffix
+            static_library_suffix
+            ${ARG_TARGETS})
+
+    if (crosscompiling)
+        set(GEN_OUTS "${RT}${static_library_suffix}")
+        unset(GEN_ARGS)
+    else ()
+        set(GEN_OUTS "${RT}${object_suffix}")
+        set(GEN_ARGS -e object)
+    endif ()
+
+    add_custom_command(OUTPUT ${GEN_OUTS}
+                       COMMAND ${generatorCommand} -r "${TARGET}.runtime" -o . ${GEN_ARGS}
+                       # Defers reading the list of targets for which to generate a common runtime to CMake _generation_ time.
+                       # This prevents issues where a lower GCD is required by a later Halide library linking to this runtime.
+                       target=$<JOIN:$<TARGET_PROPERTY:${TARGET}.runtime,Halide_RT_TARGETS>,$<COMMA>>
+                       DEPENDS "${ARG_FROM}"
+                       VERBATIM)
+
+    if (crosscompiling)
+        add_custom_target("${RT}.update" DEPENDS "${GEN_OUTS}")
+
+        add_library("${RT}" STATIC IMPORTED)
+        add_dependencies("${RT}" "${RT}.update")
+
+        set_target_properties("${RT}" PROPERTIES
+                              IMPORTED_LOCATION ${CMAKE_CURRENT_BINARY_DIR}/${GEN_OUTS})
+    else ()
+        add_library("${RT}" STATIC ${GEN_OUTS})
+        set_target_properties("${RT}" PROPERTIES LINKER_LANGUAGE CXX)
+    endif ()
+
+    target_link_libraries("${RT}" INTERFACE Halide::Runtime Threads::Threads ${CMAKE_DL_LIBS})
+    _Halide_add_targets_to_runtime("${RT}" TARGETS ${ARG_TARGETS})
+endfunction()
+
+##
+# Utilities for translating the current CMake configuration to Halide target triples and back
+##
+
+function(_Halide_triple OUTVAR)
+    # Well-formed targets must either start with "host" or a target triple.
+    if (ARGN MATCHES "host")
+        _Halide_host_target(${OUTVAR})
+    else ()
+        string(REGEX REPLACE "^([^-]+-[^-]+-[^-]+).*$" "\\1" ${OUTVAR} "${ARGN}")
+    endif ()
+    set(${OUTVAR} "${${OUTVAR}}" PARENT_SCOPE)
+endfunction()
+
+function(_Halide_cmake_target OUTVAR)
+    _Halide_arch(arch ${CMAKE_SYSTEM_PROCESSOR})
+    _Halide_bits(bits CMAKE)
+    _Halide_os(os ${CMAKE_SYSTEM_NAME})
+    set(${OUTVAR} "${arch}-${bits}-${os}" PARENT_SCOPE)
+endfunction()
+
+function(_Halide_host_target OUTVAR)
+    _Halide_arch(arch ${CMAKE_HOST_SYSTEM_PROCESSOR})
+    _Halide_bits(bits HOST)
+    _Halide_os(os ${CMAKE_HOST_SYSTEM_NAME})
+    set(${OUTVAR} "${arch}-${bits}-${os}" PARENT_SCOPE)
+endfunction()
+
+function(_Halide_arch OUTVAR arch)
+    # Canonicalize Windows's PROCESSOR_ARCHITECTURE env-var and the various `uname -m` and `uname -p` responses.
+    list(TRANSFORM arch TOLOWER)
+    list(TRANSFORM arch REPLACE "^.*(x86|arm|mips|powerpc|hexagon|wasm|riscv).*$" "\\1")
+    list(TRANSFORM arch REPLACE "^i.?86.+$" "x86")
+    list(TRANSFORM arch REPLACE "^(amd|ia|em)64t?$" "x86")
+    list(TRANSFORM arch REPLACE "^ppc(64)?$" "powerpc")
+    set(${OUTVAR} "${arch}" PARENT_SCOPE)
+endfunction()
+
+function(_Halide_bits OUTVAR ARG_HOST)
+    if (ARG_HOST STREQUAL "HOST")
+        cmake_host_system_information(RESULT bits QUERY IS_64BIT)
+        math(EXPR bits "32 + 32 * ${bits}")
+    else ()
+        math(EXPR bits "8 * ${CMAKE_SIZEOF_VOID_P}")
+    endif ()
+    set(${OUTVAR} "${bits}" PARENT_SCOPE)
+endfunction()
+
+function(_Halide_os OUTVAR os)
+    list(TRANSFORM os TOLOWER)
+    list(TRANSFORM os REPLACE "^darwin$" "osx")
+    set(${OUTVAR} "${os}" PARENT_SCOPE)
+endfunction()
+
+function(_Halide_get_platform_details OUT_GEN OUT_XC OUT_OBJ OUT_STATIC)
     if ("${ARGN}" MATCHES "host")
-        # Since all OSes must match across target triples, if "host" appears at all, then it must match CMake
-        set(${OUTVAR} "${CMAKE_STATIC_LIBRARY_SUFFIX}" PARENT_SCOPE)
-    elseif ("${ARGN}" MATCHES "windows")
-        # Otherwise, all targets are windows, so Halide emits a .lib
-        set(${OUTVAR} ".lib" PARENT_SCOPE)
+        _Halide_host_target(ARGN)
+    endif ()
+
+    if ("${ARGN}" MATCHES "windows")
+        # Otherwise, all targets are windows, so Halide emits .obj files
+        set(${OUT_OBJ} ".obj" PARENT_SCOPE)
+        set(${OUT_STATIC} ".lib" PARENT_SCOPE)
     else ()
         # All other targets use .a
-        set(${OUTVAR} ".a" PARENT_SCOPE)
+        set(${OUT_OBJ} ".o" PARENT_SCOPE)
+        set(${OUT_STATIC} ".a" PARENT_SCOPE)
     endif ()
+
+    if (WIN32)
+        # On Linux, RPATH allows the generator to find Halide, but we need to add it to the PATH on Windows.
+        set(newPath "$<TARGET_FILE_DIR:Halide::Halide>" $ENV{PATH})
+        string(REPLACE ";" "$<SEMICOLON>" newPath "${newPath}")
+        set(${OUT_GEN} ${CMAKE_COMMAND} -E env "PATH=$<SHELL_PATH:${newPath}>" "$<TARGET_FILE:${ARG_FROM}>" PARENT_SCOPE)
+    else ()
+        set(${OUT_GEN} ${ARG_FROM} PARENT_SCOPE)
+    endif ()
+
+    _Halide_triple(halide_triple "${ARGN}")
+    _Halide_cmake_target(cmake_triple)
+    if (NOT cmake_triple STREQUAL halide_triple)
+        set("${OUT_XC}" 1 PARENT_SCOPE)
+    else ()
+        set("${OUT_XC}" 0 PARENT_SCOPE)
+    endif ()
+endfunction()
+
+##
+# Utility for finding GPU libraries that are needed by
+# the runtime when listed in the Halide target string.
+##
+
+function(_Halide_add_targets_to_runtime TARGET)
+    cmake_parse_arguments(ARG "" "" "TARGETS" ${ARGN})
+
+    # Remove features that should not be attached to a runtime
+    # TODO: The fact that removing profile fixes a duplicate symbol linker error on Windows smells like a bug.
+    list(TRANSFORM ARG_TARGETS REPLACE "-(user_context|no_asserts|no_bounds_query|no_runtime|profile)" "")
+    set_property(TARGET "${TARGET}" APPEND PROPERTY Halide_RT_TARGETS "${ARG_TARGETS}")
+
+    _Halide_target_link_gpu_libs(${TARGET} INTERFACE ${ARG_TARGETS})
 endfunction()
 
 function(_Halide_target_link_gpu_libs TARGET VISIBILITY)
