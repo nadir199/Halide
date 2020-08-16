@@ -168,7 +168,7 @@ set(PARAMS_metadata_tester
 
 set(FEATURES_msan msan)
 
-set(Halide_TARGET_multitarget host host-no_bounds_query)
+set(Halide_TARGET_multitarget cmake cmake-no_bounds_query)
 set(FEATURES_multitarget c_plus_plus_name_mangling)
 set(FN_NAME_multitarget HalideTest::multitarget)
 

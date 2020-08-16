@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
+include(HalideTargetHelpers)
+
 define_property(TARGET PROPERTY Halide_RT_TARGETS
                 BRIEF_DOCS "On a Halide runtime target, lists the targets the runtime backs"
                 FULL_DOCS "On a Halide runtime target, lists the targets the runtime backs")
@@ -11,7 +13,7 @@ function(add_halide_library TARGET)
 
     # See Module.cpp for list of extra outputs. The following outputs intentionally do not appear:
     # - `c_header` is always generated
-    # - `c_source` is handled by C_BACKEND
+    # - `c_source` is selected by C_BACKEND
     # - `object` is selected for CMake-target-compile
     # - `static_library` is selected for cross-compile
     # - `cpp_stub` is not available
@@ -51,7 +53,7 @@ function(add_halide_library TARGET)
     cmake_parse_arguments(ARG "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
 
     if (NOT "${ARG_UNPARSED_ARGUMENTS}" STREQUAL "")
-        message(AUTHOR_WARNING "arguments to add_halide_library were not recognized. ${ARG_UNPARSED_ARGUMENTS}")
+        message(AUTHOR_WARNING "Arguments to add_halide_library were not recognized: ${ARG_UNPARSED_ARGUMENTS}")
     endif ()
 
     if (NOT ARG_FROM)
@@ -81,22 +83,23 @@ function(add_halide_library TARGET)
         if (NOT "${Halide_TARGET}" STREQUAL "")
             set(ARG_TARGETS "${Halide_TARGET}")
         else ()
-            _Halide_cmake_target(ARG_TARGETS)
+            _Halide_auto_target(ARG_TARGETS)
         endif ()
+    elseif (ARG_TARGETS MATCHES "cmake")
+        _Halide_auto_target(target)
+        list(TRANSFORM ARG_TARGETS REPLACE "cmake" "${target}")
     endif ()
 
-    list(JOIN ARG_FEATURES "-" features)
-    if (features)
-        list(TRANSFORM ARG_TARGETS APPEND "-${features}")
-    endif ()
-    list(TRANSFORM ARG_TARGETS APPEND "-no_runtime")
+    list(APPEND ARG_FEATURES no_runtime)
+    list(JOIN ARG_FEATURES "-" ARG_FEATURES)
+    list(TRANSFORM ARG_TARGETS APPEND "-${ARG_FEATURES}")
 
     ##
     # Set up the runtime library, if needed
     ##
 
     if (ARG_C_BACKEND)
-        # The C backend does not provide a runtime.
+        # The C backend does not provide a runtime, so just supply headers.
         set(ARG_USE_RUNTIME Halide::Runtime)
     else ()
         # If we're not using an existing runtime, create one.
@@ -116,15 +119,11 @@ function(add_halide_library TARGET)
     ##
 
     _Halide_get_platform_details(
-            generatorCommand
+            generator_cmd
             crosscompiling
             object_suffix
             static_library_suffix
             ${ARG_TARGETS})
-
-    if (crosscompiling)
-        message(STATUS "Halide generator '${ARG_FROM}' cross-compiling '${TARGET}' for '${ARG_TARGETS}'.")
-    endif ()
 
     # Always emit a C header
     set(GENERATOR_OUTPUTS c_header)
@@ -154,12 +153,12 @@ function(add_halide_library TARGET)
     list(APPEND GENERATOR_OUTPUT_FILES ${GENERATOR_SOURCES})
 
     # Add in extra outputs using the table defined at the start of this function
-    foreach (OUT IN LISTS EXTRA_OUTPUT_NAMES)
-        if (ARG_${OUT})
-            set(${ARG_${OUT}} "${TARGET}${${OUT}_extension}" PARENT_SCOPE)
-            list(APPEND GENERATOR_OUTPUT_FILES "${TARGET}${${OUT}_extension}")
-            string(TOLOWER "${OUT}" OUT)
-            list(APPEND GENERATOR_OUTPUTS ${OUT})
+    foreach (out IN LISTS EXTRA_OUTPUT_NAMES)
+        if (ARG_${out})
+            set(${ARG_${out}} "${TARGET}${${out}_extension}" PARENT_SCOPE)
+            list(APPEND GENERATOR_OUTPUT_FILES "${TARGET}${${out}_extension}")
+            string(TOLOWER "${out}" out)
+            list(APPEND GENERATOR_OUTPUTS ${out})
         endif ()
     endforeach ()
 
@@ -199,14 +198,14 @@ function(add_halide_library TARGET)
     # Load the plugins and setup dependencies
     unset(GEN_PLUGINS)
     if (ARG_PLUGINS)
-        foreach (P IN LISTS ARG_PLUGINS)
-            list(APPEND GEN_PLUGINS "$<TARGET_FILE:${P}>")
+        foreach (p IN LISTS ARG_PLUGINS)
+            list(APPEND GEN_PLUGINS "$<TARGET_FILE:${p}>")
         endforeach ()
         set(GEN_PLUGINS -p "$<JOIN:${GEN_PLUGINS},$<COMMA>>")
     endif ()
 
     add_custom_command(OUTPUT ${GENERATOR_OUTPUT_FILES}
-                       COMMAND ${generatorCommand}
+                       COMMAND ${generator_cmd}
                        -n "${TARGET}"
                        -d "${GRADIENT_DESCENT}"
                        -g "${ARG_GENERATOR}"
@@ -236,7 +235,7 @@ endfunction()
 function(add_halide_runtime RT)
     cmake_parse_arguments(ARG "" "FROM" "TARGETS" ${ARGN})
     _Halide_get_platform_details(
-            generatorCommand
+            generator_cmd
             crosscompiling
             object_suffix
             static_library_suffix
@@ -251,7 +250,7 @@ function(add_halide_runtime RT)
     endif ()
 
     add_custom_command(OUTPUT ${GEN_OUTS}
-                       COMMAND ${generatorCommand} -r "${TARGET}.runtime" -o . ${GEN_ARGS}
+                       COMMAND ${generator_cmd} -r "${TARGET}.runtime" -o . ${GEN_ARGS}
                        # Defers reading the list of targets for which to generate a common runtime to CMake _generation_ time.
                        # This prevents issues where a lower GCD is required by a later Halide library linking to this runtime.
                        target=$<JOIN:$<TARGET_PROPERTY:${TARGET}.runtime,Halide_RT_TARGETS>,$<COMMA>>
@@ -275,63 +274,9 @@ function(add_halide_runtime RT)
     _Halide_add_targets_to_runtime("${RT}" TARGETS ${ARG_TARGETS})
 endfunction()
 
-##
-# Utilities for translating the current CMake configuration to Halide target triples and back
-##
-
-function(_Halide_triple OUTVAR)
-    # Well-formed targets must either start with "host" or a target triple.
-    if (ARGN MATCHES "host")
-        _Halide_host_target(${OUTVAR})
-    else ()
-        string(REGEX REPLACE "^([^-]+-[^-]+-[^-]+).*$" "\\1" ${OUTVAR} "${ARGN}")
-    endif ()
-    set(${OUTVAR} "${${OUTVAR}}" PARENT_SCOPE)
-endfunction()
-
-function(_Halide_cmake_target OUTVAR)
-    _Halide_arch(arch ${CMAKE_SYSTEM_PROCESSOR})
-    _Halide_bits(bits CMAKE)
-    _Halide_os(os ${CMAKE_SYSTEM_NAME})
-    set(${OUTVAR} "${arch}-${bits}-${os}" PARENT_SCOPE)
-endfunction()
-
-function(_Halide_host_target OUTVAR)
-    _Halide_arch(arch ${CMAKE_HOST_SYSTEM_PROCESSOR})
-    _Halide_bits(bits HOST)
-    _Halide_os(os ${CMAKE_HOST_SYSTEM_NAME})
-    set(${OUTVAR} "${arch}-${bits}-${os}" PARENT_SCOPE)
-endfunction()
-
-function(_Halide_arch OUTVAR arch)
-    # Canonicalize Windows's PROCESSOR_ARCHITECTURE env-var and the various `uname -m` and `uname -p` responses.
-    list(TRANSFORM arch TOLOWER)
-    list(TRANSFORM arch REPLACE "^.*(x86|arm|mips|powerpc|hexagon|wasm|riscv).*$" "\\1")
-    list(TRANSFORM arch REPLACE "^i.?86.+$" "x86")
-    list(TRANSFORM arch REPLACE "^(amd|ia|em)64t?$" "x86")
-    list(TRANSFORM arch REPLACE "^ppc(64)?$" "powerpc")
-    set(${OUTVAR} "${arch}" PARENT_SCOPE)
-endfunction()
-
-function(_Halide_bits OUTVAR ARG_HOST)
-    if (ARG_HOST STREQUAL "HOST")
-        cmake_host_system_information(RESULT bits QUERY IS_64BIT)
-        math(EXPR bits "32 + 32 * ${bits}")
-    else ()
-        math(EXPR bits "8 * ${CMAKE_SIZEOF_VOID_P}")
-    endif ()
-    set(${OUTVAR} "${bits}" PARENT_SCOPE)
-endfunction()
-
-function(_Halide_os OUTVAR os)
-    list(TRANSFORM os TOLOWER)
-    list(TRANSFORM os REPLACE "^darwin$" "osx")
-    set(${OUTVAR} "${os}" PARENT_SCOPE)
-endfunction()
-
 function(_Halide_get_platform_details OUT_GEN OUT_XC OUT_OBJ OUT_STATIC)
     if ("${ARGN}" MATCHES "host")
-        _Halide_host_target(ARGN)
+        set(ARGN "${Halide_HOST_TARGET}")
     endif ()
 
     if ("${ARGN}" MATCHES "windows")
