@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-include(HalideTargetHelpers)
+include(${CMAKE_CURRENT_LIST_DIR}/HalideTargetHelpers.cmake)
 
 define_property(TARGET PROPERTY Halide_RT_TARGETS
                 BRIEF_DOCS "On a Halide runtime target, lists the targets the runtime backs"
